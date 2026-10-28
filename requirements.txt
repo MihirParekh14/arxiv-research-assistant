@@ -1,0 +1,3 @@
+# Phase 1: data ingestion and chunking.
+# Later phases add sentence-transformers, faiss-cpu and an LLM client.
+datasets>=2.19
