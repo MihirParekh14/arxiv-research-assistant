@@ -12,8 +12,10 @@ side.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from src import config
 from src.data import Paper
@@ -111,6 +113,43 @@ def chunk_papers(papers: Iterable[Paper], **kwargs) -> Iterator[Chunk]:
     """Cut many papers, yielding chunks as they are produced."""
     for paper in papers:
         yield from chunk_paper(paper, **kwargs)
+
+
+def save_chunks(chunks: Iterable[Chunk], path: str | Path) -> int:
+    """Write chunks to a JSONL file, one JSON object per line."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    with path.open("w", encoding="utf-8") as handle:
+        for chunk in chunks:
+            handle.write(json.dumps(chunk.to_dict(), ensure_ascii=False) + "\n")
+            count += 1
+    return count
+
+
+def load_chunks(path: str | Path) -> list[Chunk]:
+    """Read chunks back, in the order they were written.
+
+    Order is not a detail here. The embedding step writes one vector per chunk
+    in this same order, and search looks a result up by its row number. If the
+    two ever disagreed, every answer would cite the wrong paper while looking
+    perfectly convincing. A list is returned rather than an iterator so that
+    order is fixed and the file is read exactly once.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Run `python -m src.ingest --limit 1000` first."
+        )
+
+    chunks = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                chunks.append(Chunk(**json.loads(line)))
+    return chunks
 
 
 def chunk_stats(chunks: Iterable[Chunk]) -> dict:

@@ -7,12 +7,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import time
 from pathlib import Path
 
 from src import config
-from src.chunking import chunk_papers, chunk_stats
+from src.chunking import chunk_papers, chunk_stats, save_chunks
 from src.data import fetch_papers, load_papers, save_papers
 
 
@@ -68,11 +67,7 @@ def main() -> None:
     )
 
     chunks = list(chunk_papers(load_papers(papers_path)))
-
-    chunks_path.parent.mkdir(parents=True, exist_ok=True)
-    with chunks_path.open("w", encoding="utf-8") as handle:
-        for chunk in chunks:
-            handle.write(json.dumps(chunk.to_dict(), ensure_ascii=False) + "\n")
+    save_chunks(chunks, chunks_path)
 
     # --- Step 3: report ----------------------------------------------------
 

@@ -20,8 +20,8 @@ This is being built in stages. Each stage is tested before the next begins.
 | Stage | What it does | Status |
 |---|---|---|
 | 1. Ingestion | Download papers, clean, chunk with overlap | **Done** |
-| 2. Embeddings | Encode chunks, build a FAISS index | Next |
-| 3. Retrieval + answers | Search, assemble a prompt, generate with citations | Planned |
+| 2. Search | Encode chunks, build a FAISS index, retrieve by meaning | **Done** |
+| 3. Answers | Assemble a prompt from retrieved passages, generate with citations | Next |
 | 4. Classifier | Multi-label subject tagging (fine-tuned RoBERTa) | Planned |
 | 5. Summarizer | Abstractive summaries (google/pegasus-arxiv) | Planned |
 | 6. Evaluation | Held-out splits, retrieval and answer metrics | Planned |
@@ -59,6 +59,19 @@ Re-chunk what you already downloaded, without downloading again:
 python -m src.ingest --reuse-papers
 ```
 
+Encode every chunk and build the search index:
+
+```bash
+python -m src.build_index
+```
+
+Search:
+
+```bash
+python -m src.search "how do diffusion models handle image inpainting"
+python -m src.search "contrastive loss" --top-k 10
+```
+
 Output lands in `data/`, which is gitignored. Nothing large is committed.
 
 A run of 1,000 papers takes about 20 seconds and produces roughly 49,000 chunks.
@@ -84,7 +97,10 @@ tear the same connection down without complaint.
 
 ```
 arXiv dataset  ──►  normalise  ──►  clean  ──►  chunk  ──►  chunks.jsonl
-   (streamed)        one shape     whitespace   overlap
+   (streamed)        one shape     whitespace   overlap         │
+                                                                ▼
+          results  ◄──  FAISS  ◄──  index  ◄──  encode  ◄──  150-word
+         (ranked)       search                  (MiniLM)      passages
 ```
 
 **Streaming, not downloading.** The source dataset holds 138,000 papers. Pulling
@@ -146,6 +162,37 @@ All three values live in `src/config.py`.
 
 ---
 
+## How the search works
+
+Each chunk is encoded into 384 numbers. Chunks about the same thing land near
+each other in that space, even when they share no words — "image inpainting"
+and "filling masked regions" end up close because the model learned they mean
+the same thing. A query is encoded the same way, and search is then just a
+question of which stored vectors point most nearly in the same direction.
+
+**Vectors are normalised to length 1.** For unit vectors the dot product is
+exactly the cosine of the angle between them, so FAISS's inner-product search
+gives cosine similarity with no extra work. Skipping this step would let long
+vectors win on size rather than relevance, and vector length tracks things like
+passage length, not meaning.
+
+**The index is flat, not approximate.** `IndexFlatIP` compares the query
+against all 49,000 vectors — no approximation, no training step, exact results.
+Approximate indexes like IVF and HNSW trade recall for speed and earn their
+keep at millions of vectors. At this size an exact scan is about 19 million
+multiply-adds, which takes a few milliseconds, so approximation would cost
+accuracy and buy nothing.
+
+**Row order is the contract.** Line *i* of `chunks.jsonl`, row *i* of
+`vectors.npy` and position *i* in the index are the same passage. That is the
+only link between a vector and the text it came from, and it fails silently:
+if they ever drifted apart, every answer would cite a real passage from the
+wrong paper and look entirely convincing. So the index records the model and
+corpus size it was built from, and search refuses to run against a mismatch
+instead of answering from stale rows.
+
+---
+
 ## Testing
 
 ```bash
@@ -153,19 +200,29 @@ pytest --cov=src --cov-report=term-missing
 ruff check src tests
 ```
 
-42 tests. CI runs both on Python 3.10, 3.11 and 3.12 on every push.
+76 tests. CI runs both on Python 3.10, 3.11 and 3.12 on every push.
 
-The tests never touch the network and never need a dataset or an API key. Every
-test builds its own records, so the suite runs anywhere in under a second.
+The tests never touch the network, never download a model and never need an API
+key. A stand-in encoder returns fixed vectors, so the whole suite runs anywhere
+in well under a second.
 
-The chunking tests get the most attention, because chunking is where retrieval
-systems quietly break. An off-by-one in the step size either drops text between
-chunks or repeats it forever, and neither failure is visible from the output —
-you just get worse answers. So the tests pin down the boundaries directly: that
-consecutive chunks share exactly the configured overlap, that chunk starts
-advance by exactly the step size, that every word of the input appears in at
-least one chunk, and that an overlap greater than or equal to the chunk size is
-rejected rather than looping forever.
+Most of the attention goes to the two places a retrieval system breaks quietly.
+
+**Chunking.** An off-by-one in the step size either drops text between chunks
+or repeats it forever, and neither failure is visible from the output — you
+just get worse answers. The tests pin the boundaries down directly: consecutive
+chunks share exactly the configured overlap, chunk starts advance by exactly
+the step size, every word of the input appears in at least one chunk, and an
+overlap greater than or equal to the chunk size is rejected rather than looping
+forever.
+
+**The link between a vector and its text.** Everything between a query and an
+answer is numbers, so a result pointing at the wrong row looks exactly like one
+pointing at the right row. A keyword-counting stand-in encoder makes this
+testable without a model: a query for "protein" must come back with the passage
+about proteins, not merely with *a* passage. The guards against a stale index —
+wrong corpus size, wrong model — are tested too, because both of those produce
+confident nonsense rather than an error.
 
 ---
 
@@ -173,13 +230,16 @@ rejected rather than looping forever.
 
 ```
 src/
-  config.py      all tunable values in one place
-  data.py        download, normalise, save and load papers
-  chunking.py    split papers into overlapping passages
-  ingest.py      command line entry point
-tests/           pytest suite, no network required
-notebooks/       exploration
-data/            downloaded and generated files (gitignored)
+  config.py        all tunable values in one place
+  data.py          download, normalise, save and load papers
+  chunking.py      split papers into overlapping passages
+  embed.py         turn text into unit vectors
+  index.py         build, save and query the FAISS index
+  ingest.py        command line: download and chunk
+  build_index.py   command line: encode and index
+  search.py        command line: ask a question
+tests/             pytest suite, no network or model required
+data/              downloaded and generated files (gitignored)
 ```
 
 ---

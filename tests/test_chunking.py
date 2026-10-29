@@ -9,7 +9,15 @@ from __future__ import annotations
 
 import pytest
 
-from src.chunking import Chunk, chunk_paper, chunk_papers, chunk_stats, split_words
+from src.chunking import (
+    Chunk,
+    chunk_paper,
+    chunk_papers,
+    chunk_stats,
+    load_chunks,
+    save_chunks,
+    split_words,
+)
 from src.data import Paper
 
 
@@ -154,6 +162,34 @@ def test_chunk_papers_keeps_papers_separate():
 def test_a_paper_too_short_to_chunk_yields_nothing():
     chunks = chunk_paper(make_paper(5), chunk_words=100, overlap_words=20)
     assert chunks == []
+
+
+# --- saving and loading ----------------------------------------------------
+
+
+def test_save_then_load_returns_identical_chunks(tmp_path):
+    original = chunk_paper(make_paper(300), chunk_words=100, overlap_words=20)
+    path = tmp_path / "chunks.jsonl"
+
+    assert save_chunks(original, path) == len(original)
+    assert load_chunks(path) == original
+
+
+def test_loaded_chunks_keep_their_written_order(tmp_path):
+    """The embedding step writes one vector per line, in this order. If the
+    order ever changed on the way back, every result would cite a neighbour."""
+    original = chunk_paper(make_paper(1000), chunk_words=100, overlap_words=20)
+    path = tmp_path / "chunks.jsonl"
+    save_chunks(original, path)
+
+    assert [chunk.chunk_id for chunk in load_chunks(path)] == [
+        chunk.chunk_id for chunk in original
+    ]
+
+
+def test_load_chunks_raises_a_helpful_error_when_file_is_absent(tmp_path):
+    with pytest.raises(FileNotFoundError, match="src.ingest"):
+        load_chunks(tmp_path / "nothing.jsonl")
 
 
 # --- stats -----------------------------------------------------------------

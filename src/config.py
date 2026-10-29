@@ -15,6 +15,12 @@ RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 INDEX_DIR = DATA_DIR / "index"
 
+PAPERS_FILE = RAW_DIR / "papers.jsonl"
+CHUNKS_FILE = PROCESSED_DIR / "chunks.jsonl"
+VECTORS_FILE = INDEX_DIR / "vectors.npy"
+INDEX_FILE = INDEX_DIR / "index.faiss"
+INDEX_META_FILE = INDEX_DIR / "index_meta.json"
+
 # --- Data source -----------------------------------------------------------
 
 # 138k arXiv papers with full markdown text, not just abstracts.
@@ -47,6 +53,11 @@ MIN_CHUNK_WORDS = 25
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 EMBEDDING_MAX_TOKENS = 256
+
+# How many chunks the encoder processes at once. Larger batches are faster but
+# hold more in memory at the same time. 64 keeps a laptop CPU busy without
+# making the machine unusable while it runs.
+EMBED_BATCH_SIZE = 64
 
 SUMMARIZER_MODEL = "google/pegasus-arxiv"
 CLASSIFIER_BASE_MODEL = "roberta-base"
