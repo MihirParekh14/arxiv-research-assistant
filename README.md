@@ -65,6 +65,10 @@ Encode every chunk and build the search index:
 python -m src.build_index
 ```
 
+Encoding writes a block to disk every 8,192 chunks, so stopping it is safe --
+re-running the same command continues from the last finished block. Add
+`--fresh` to re-encode everything, or `--limit N` for a quick trial run.
+
 Search:
 
 ```bash
@@ -74,7 +78,8 @@ python -m src.search "contrastive loss" --top-k 10
 
 Output lands in `data/`, which is gitignored. Nothing large is committed.
 
-A run of 1,000 papers takes about 20 seconds and produces roughly 49,000 chunks.
+A run of 1,000 papers takes about 20 seconds and produces roughly 49,000
+chunks. Encoding them takes about 40 minutes on a laptop CPU.
 
 ### Known warning on Windows
 
@@ -183,6 +188,21 @@ keep at millions of vectors. At this size an exact scan is about 19 million
 multiply-adds, which takes a few milliseconds, so approximation would cost
 accuracy and buy nothing.
 
+**Encoding runs in blocks, and resumes.** The first version handed every
+passage to the encoder in a single call. That was fine at 49,000 and fell over
+at 253,000: holding all the inputs and outputs at once pushed the machine into
+swap, and throughput dropped from 3 seconds per batch to 213 — a factor of
+sixty, not a slowdown you can wait out. A job that was three hours of real work
+was reporting eight days remaining.
+
+So each block of 8,192 passages is encoded, written to disk, and released.
+Memory stays flat whatever the corpus size, and an interrupted run continues
+from the last finished block instead of starting again. Blocks are written to a
+temporary name and renamed, so a run killed mid-write leaves nothing half
+finished, and a block whose length does not match is re-encoded rather than
+trusted. A manifest records the corpus size, block size and model, and blocks
+from a different corpus are discarded rather than stitched onto the new one.
+
 **Row order is the contract.** Line *i* of `chunks.jsonl`, row *i* of
 `vectors.npy` and position *i* in the index are the same passage. That is the
 only link between a vector and the text it came from, and it fails silently:
@@ -200,7 +220,7 @@ pytest --cov=src --cov-report=term-missing
 ruff check src tests
 ```
 
-76 tests. CI runs both on Python 3.10, 3.11 and 3.12 on every push.
+88 tests. CI runs both on Python 3.10, 3.11 and 3.12 on every push.
 
 The tests never touch the network, never download a model and never need an API
 key. A stand-in encoder returns fixed vectors, so the whole suite runs anywhere
@@ -233,7 +253,7 @@ src/
   config.py        all tunable values in one place
   data.py          download, normalise, save and load papers
   chunking.py      split papers into overlapping passages
-  embed.py         turn text into unit vectors
+  embed.py         turn text into unit vectors, in resumable blocks
   index.py         build, save and query the FAISS index
   ingest.py        command line: download and chunk
   build_index.py   command line: encode and index

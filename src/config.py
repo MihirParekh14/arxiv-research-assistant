@@ -18,6 +18,7 @@ INDEX_DIR = DATA_DIR / "index"
 PAPERS_FILE = RAW_DIR / "papers.jsonl"
 CHUNKS_FILE = PROCESSED_DIR / "chunks.jsonl"
 VECTORS_FILE = INDEX_DIR / "vectors.npy"
+BLOCKS_DIR = INDEX_DIR / "blocks"
 INDEX_FILE = INDEX_DIR / "index.faiss"
 INDEX_META_FILE = INDEX_DIR / "index_meta.json"
 
@@ -58,6 +59,18 @@ EMBEDDING_MAX_TOKENS = 256
 # hold more in memory at the same time. 64 keeps a laptop CPU busy without
 # making the machine unusable while it runs.
 EMBED_BATCH_SIZE = 64
+
+# How many chunks are encoded before the results are written to disk and the
+# memory is released.
+#
+# This is not a speed knob, it is a survival one. Handing a quarter of a million
+# passages to the encoder in a single call holds every input string and every
+# output tensor in memory at once; past the point where that fits, the machine
+# starts paging to disk and throughput collapses by a factor of sixty rather
+# than degrading gently. Encoding in blocks keeps memory flat no matter how
+# large the corpus grows, and it means an interrupted run resumes from the last
+# finished block instead of starting again.
+EMBED_BLOCK_SIZE = 8192
 
 SUMMARIZER_MODEL = "google/pegasus-arxiv"
 CLASSIFIER_BASE_MODEL = "roberta-base"

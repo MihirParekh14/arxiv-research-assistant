@@ -9,7 +9,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.embed import embed_texts, load_vectors, normalize, save_vectors
+from src.embed import (
+    block_path,
+    clear_blocks,
+    embed_in_blocks,
+    embed_texts,
+    load_blocks,
+    load_vectors,
+    normalize,
+    save_vectors,
+)
 
 
 class FakeEncoder:
@@ -17,10 +26,17 @@ class FakeEncoder:
 
     def __init__(self):
         self.batch_sizes: list[int] = []
+        self.texts_seen: list[str] = []
 
     def encode(self, texts, batch_size=32, show_progress_bar=False, convert_to_numpy=True):
         self.batch_sizes.append(batch_size)
+        self.texts_seen.extend(texts)
         return np.array([[float(len(t)), 1.0, 0.0, 0.0] for t in texts], dtype="float32")
+
+
+def many(count: int) -> list[str]:
+    """Distinct texts whose first vector component is their length."""
+    return [f"t{'x' * i}" for i in range(count)]
 
 
 # --- normalize -------------------------------------------------------------
@@ -110,3 +126,120 @@ def test_saved_vectors_are_float32(tmp_path):
 def test_load_vectors_raises_a_helpful_error_when_file_is_absent(tmp_path):
     with pytest.raises(FileNotFoundError, match="build_index"):
         load_vectors(tmp_path / "nothing.npy")
+
+
+# --- block encoding and resume ---------------------------------------------
+#
+# Encoding a quarter of a million passages in one call exhausts memory and the
+# machine starts paging, which slows it by a factor of sixty rather than a few
+# percent. Blocks keep memory flat and let an interrupted run continue. These
+# tests cover the parts of that which fail quietly.
+
+
+def test_blocks_cover_every_text_including_a_short_final_block(tmp_path):
+    written = embed_in_blocks(many(25), FakeEncoder(), tmp_path, block_size=10)
+
+    assert written == 25
+    assert np.load(block_path(tmp_path, 0)).shape == (10, 4)
+    assert np.load(block_path(tmp_path, 10)).shape == (10, 4)
+    assert np.load(block_path(tmp_path, 20)).shape == (5, 4)
+
+
+def test_joined_blocks_match_a_single_pass_exactly(tmp_path):
+    texts = many(25)
+    embed_in_blocks(texts, FakeEncoder(), tmp_path, block_size=10)
+
+    joined = load_blocks(tmp_path, total=25, block_size=10)
+    one_pass = embed_texts(texts, encoder=FakeEncoder(), show_progress=False)
+    assert np.allclose(joined, one_pass)
+
+
+def test_a_resumed_run_only_encodes_what_is_missing(tmp_path):
+    texts = many(25)
+    embed_in_blocks(texts, FakeEncoder(), tmp_path, block_size=10)
+    block_path(tmp_path, 20).unlink()
+
+    encoder = FakeEncoder()
+    embed_in_blocks(texts, encoder, tmp_path, block_size=10)
+
+    assert len(encoder.texts_seen) == 5
+    assert encoder.texts_seen == texts[20:]
+
+
+def test_fresh_run_re_encodes_everything(tmp_path):
+    texts = many(25)
+    embed_in_blocks(texts, FakeEncoder(), tmp_path, block_size=10)
+
+    encoder = FakeEncoder()
+    embed_in_blocks(texts, encoder, tmp_path, block_size=10, resume=False)
+    assert len(encoder.texts_seen) == 25
+
+
+def test_a_truncated_block_is_re_encoded_rather_than_trusted(tmp_path):
+    """A run killed mid-write leaves a short file. Reusing it would shift every
+    later vector out of line with its text."""
+    texts = many(25)
+    embed_in_blocks(texts, FakeEncoder(), tmp_path, block_size=10)
+    np.save(block_path(tmp_path, 10), np.zeros((3, 4), dtype="float32"))
+
+    encoder = FakeEncoder()
+    embed_in_blocks(texts, encoder, tmp_path, block_size=10)
+    assert encoder.texts_seen == texts[10:20]
+
+
+def test_a_corpus_of_a_different_size_discards_the_old_blocks(tmp_path):
+    """Resuming across two different corpora would stitch together vectors from
+    both, and every citation after the seam would be wrong."""
+    embed_in_blocks(many(25), FakeEncoder(), tmp_path, block_size=10)
+
+    encoder = FakeEncoder()
+    embed_in_blocks(many(15), encoder, tmp_path, block_size=10)
+
+    assert len(encoder.texts_seen) == 15
+    assert not block_path(tmp_path, 20).exists()
+
+
+def test_changing_the_embedding_model_discards_the_old_blocks(tmp_path):
+    """Nothing about the shapes changes, so this fails silently otherwise."""
+    texts = many(20)
+    embed_in_blocks(texts, FakeEncoder(), tmp_path, block_size=10, model_name="old")
+
+    encoder = FakeEncoder()
+    embed_in_blocks(texts, encoder, tmp_path, block_size=10, model_name="new")
+    assert len(encoder.texts_seen) == 20
+
+
+def test_changing_the_block_size_discards_the_old_blocks(tmp_path):
+    """Old blocks start at different row offsets, so they cannot be reused."""
+    texts = many(20)
+    embed_in_blocks(texts, FakeEncoder(), tmp_path, block_size=10)
+
+    encoder = FakeEncoder()
+    embed_in_blocks(texts, encoder, tmp_path, block_size=5)
+    assert len(encoder.texts_seen) == 20
+
+
+def test_a_block_size_of_zero_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="block_size must be positive"):
+        embed_in_blocks(many(5), FakeEncoder(), tmp_path, block_size=0)
+
+
+def test_clear_blocks_removes_blocks_and_manifest(tmp_path):
+    embed_in_blocks(many(25), FakeEncoder(), tmp_path, block_size=10)
+    clear_blocks(tmp_path)
+
+    assert list(tmp_path.glob("vectors_*.npy")) == []
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_load_blocks_names_the_missing_block_instead_of_returning_short(tmp_path):
+    embed_in_blocks(many(25), FakeEncoder(), tmp_path, block_size=10)
+    block_path(tmp_path, 10).unlink()
+
+    with pytest.raises(FileNotFoundError, match="build_index"):
+        load_blocks(tmp_path, total=25, block_size=10)
+
+
+def test_no_temporary_files_survive_a_finished_run(tmp_path):
+    embed_in_blocks(many(25), FakeEncoder(), tmp_path, block_size=10)
+    assert list(tmp_path.glob("*.tmp")) == []
