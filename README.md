@@ -21,7 +21,8 @@ This is being built in stages. Each stage is tested before the next begins.
 |---|---|---|
 | 1. Ingestion | Download papers, clean, chunk with overlap | **Done** |
 | 2. Search | Encode chunks, build a FAISS index, retrieve by meaning | **Done** |
-| 3. Answers | Assemble a prompt from retrieved passages, generate with citations | Next |
+| 3. Answers | Assemble a prompt from retrieved passages, generate with citations | **Done** |
+| 3.5 Reranking | Cross-encoder rerank over the top 20 (see known limitation) | Next |
 | 4. Classifier | Multi-label subject tagging (fine-tuned RoBERTa) | Planned |
 | 5. Summarizer | Abstractive summaries (google/pegasus-arxiv) | Planned |
 | 6. Evaluation | Held-out splits, retrieval and answer metrics | Planned |
@@ -75,6 +76,20 @@ Search:
 python -m src.search "how do diffusion models handle image inpainting"
 python -m src.search "contrastive loss" --top-k 10
 ```
+
+Ask a question and get an answer with citations:
+
+```bash
+python -m src.ask "how do diffusion models handle image inpainting"
+python -m src.ask "what is speculative decoding" --backend ollama
+python -m src.ask "how does LoRA work" --backend anthropic
+python -m src.ask "anything" --show-prompt     # see exactly what the model is sent
+```
+
+The default backend is `extractive`: it returns the retrieved passages
+themselves and calls no model, so the project runs with no API key and the
+retrieval half can be judged on its own. `anthropic` needs `ANTHROPIC_API_KEY`
+in a `.env` file; `ollama` needs `ollama serve` running locally.
 
 Output lands in `data/`, which is gitignored. Nothing large is committed.
 
@@ -182,7 +197,7 @@ vectors win on size rather than relevance, and vector length tracks things like
 passage length, not meaning.
 
 **The index is flat, not approximate.** `IndexFlatIP` compares the query
-against all 49,000 vectors — no approximation, no training step, exact results.
+against all 253,000 vectors — no approximation, no training step, exact results.
 Approximate indexes like IVF and HNSW trade recall for speed and earn their
 keep at millions of vectors. At this size an exact scan is about 19 million
 multiply-adds, which takes a few milliseconds, so approximation would cost
@@ -213,6 +228,119 @@ instead of answering from stale rows.
 
 ---
 
+## How the answering works
+
+Retrieval finds passages. Answering decides whether they are good enough to
+answer from, assembles them into a prompt, and asks a model for an answer that
+cites them. Three decisions shape it, and two of them came from measurements
+rather than from judgement.
+
+### Growing the corpus, and what it showed
+
+The corpus went from 1,000 papers to 5,000 — 49,334 passages to 253,405. The
+same two queries were run before and after.
+
+| Query | | 1,000 papers | 5,000 papers |
+|---|---|---|---|
+| image inpainting | top score | 0.627 | **0.729** |
+| | spread | 0.018 | 0.043 |
+| transformer attention | top score | 0.657 | 0.677 |
+| | spread | 0.086 | **0.025** |
+
+The inpainting query improved exactly as expected: more papers, better
+coverage, and the top result became a paper titled *Gradpaint: Gradient-Guided
+Inpainting with Diffusion Models*. A false match from the smaller corpus — a
+depth-estimation paper that matched on "regions with missing values" —
+disappeared.
+
+The spread is the interesting column, because it moved in opposite directions.
+
+### The confidence signal, and the idea that did not survive
+
+The first plan was to treat a narrow spread between the top and bottom scores
+as a sign that the corpus had nothing to offer, and refuse to answer. The table
+above kills that idea. Inpainting had almost no good matches, so everything sat
+low together and the spread was narrow; adding papers lifted the top and the
+spread widened. Transformer attention had one excellent match and then a cliff;
+adding papers lifted the *tail* until all five were strong, and the spread
+narrowed.
+
+A narrow spread means either *nothing matches* or *everything matches well*,
+and nothing distinguishes the two. The top score separated good answers from
+bad ones in all four runs, so it is what the confidence gate uses: below
+`MIN_ANSWER_SCORE` the system refuses and never builds a prompt, between that
+and `WEAK_ANSWER_SCORE` it answers with a warning. Both numbers are provisional
+starting points; stage 6 measures them against a held-out question set.
+
+### Capping how much one paper can contribute
+
+On the larger index, the inpainting query returned **four of its five results
+from a single paper**. Better retrieval made this worse, not better: once a
+strongly matching paper exists, its chunks crowd out everything else.
+
+For search that is only untidy. For a generated answer it is a defect, because
+those passages are the entire material the answer is written from — an answer
+drawn from one paper cites one paper and sounds exactly as confident as one
+drawn from five. So no paper may supply more than `MAX_CHUNKS_PER_PAPER`
+passages, and the index is asked for five times as many results as are wanted
+so that capping replaces results rather than losing them.
+
+### A known limitation: the query is one vector
+
+Two queries about the same thing, run against the same index, expose the
+ceiling of this design.
+
+**Query A — "how does LoRA work"** returned three passages genuinely about
+Low-Rank Adaptation, and two about **LoRa**, the long-range radio protocol —
+chirp demodulation, spreading factors, LoRaWAN jamming. Two unrelated
+technologies, nearly the same spelling, and a bi-encoder cannot separate them.
+
+**Query B — "how does low-rank adaptation work for fine-tuning language
+models"** removed the radio papers and made the result set worse: only one of
+five was about LoRA. The rest were about fine-tuning in general — annotating
+data for rankers, Arabic machine translation, multilingual vocabularies. The
+added words are common in this corpus, so averaging them into one vector
+diluted the one distinctive term until the query pointed at generic NLP
+adaptation.
+
+| Query | Passages about LoRA | Top score |
+|---|---|---|
+| "how does LoRA work" | 3 of 5 | 0.645 |
+| "how does low-rank adaptation work for fine-tuning language models" | 1 of 5 | **0.680** |
+
+Note which one scored higher. Similarity to the query vector is not answer
+quality, and here the two point in opposite directions. The confidence gate is
+still worth having — it catches the case where nothing matches at all — but it
+grades the top match, not the correctness of the list.
+
+Neither failure is fixed by a larger corpus; more papers means more radio
+papers. Both have the same cause: a bi-encoder embeds the query and the passage
+separately and never compares them directly.
+
+The standard fix is a **cross-encoder reranker** — retrieve twenty passages
+with the fast vector search, then score each one with a model that reads the
+question and the passage together. Reading both at once is what allows
+"spreading factor" to be recognised as irrelevant to a fine-tuning question.
+That is the next thing this project needs, ahead of anything in stages 4 or 5.
+
+Also worth recording: the best explanation of LoRA in the whole corpus came
+from a passage inside *"Hate speech detection in algerian dialect using deep
+learning"*, a paper whose title gives no sign of it. Indexing whole papers
+would have missed it; indexing passages found it.
+
+### Refusing is a feature
+
+Below the score floor, no prompt is built and no model is called. The prompt
+itself also tells the model to answer only from the passages and to say so when
+they do not cover the question.
+
+A system that always produces fluent text is worse than one that sometimes
+declines, because a wrong answer with a citation attached is harder to catch
+than no answer at all. Both paths are tested: that a weak result set returns a
+refusal, and that it reaches no generator.
+
+---
+
 ## Testing
 
 ```bash
@@ -220,7 +348,7 @@ pytest --cov=src --cov-report=term-missing
 ruff check src tests
 ```
 
-88 tests. CI runs both on Python 3.10, 3.11 and 3.12 on every push.
+117 tests. CI runs both on Python 3.10, 3.11 and 3.12 on every push.
 
 The tests never touch the network, never download a model and never need an API
 key. A stand-in encoder returns fixed vectors, so the whole suite runs anywhere
@@ -244,6 +372,13 @@ about proteins, not merely with *a* passage. The guards against a stale index �
 wrong corpus size, wrong model — are tested too, because both of those produce
 confident nonsense rather than an error.
 
+**What the model is allowed to see.** No test calls a model; the generator is
+injected. What is covered instead is everything around it: that the prompt
+contains every passage numbered from one, that those numbers match the source
+list so a citation can be checked, that the prompt forbids outside knowledge
+and permits refusal, that a weak result set returns a refusal *and reaches no
+generator at all*, and that one paper cannot take the whole result set.
+
 ---
 
 ## Project layout
@@ -257,7 +392,9 @@ src/
   index.py         build, save and query the FAISS index
   ingest.py        command line: download and chunk
   build_index.py   command line: encode and index
-  search.py        command line: ask a question
+  search.py        command line: search
+  answer.py        confidence, prompt assembly, generator backends
+  ask.py           command line: ask a question
 tests/             pytest suite, no network or model required
 data/              downloaded and generated files (gitignored)
 ```

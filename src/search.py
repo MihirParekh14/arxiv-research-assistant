@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 import textwrap
 from dataclasses import dataclass
 
@@ -25,14 +26,59 @@ class SearchResult:
     score: float
 
 
-def search(query: str, chunks: list[Chunk], index, encoder, top_k: int = config.TOP_K):
-    """Return the ``top_k`` chunks closest in meaning to ``query``.
+def search(
+    query: str,
+    chunks: list[Chunk],
+    index,
+    encoder,
+    top_k: int = config.TOP_K,
+    max_per_paper: int = config.MAX_CHUNKS_PER_PAPER,
+    oversample: int = config.RETRIEVAL_OVERSAMPLE,
+):
+    """Return the ``top_k`` closest passages, at most ``max_per_paper`` per paper.
 
     The query goes through exactly the same encoder as the corpus did. That is
     not a convenience -- a query encoded by a different model would land
     somewhere unrelated in the vector space, and the results would be random
     while still looking plausible.
+
+    The cap exists because a strongly matching paper otherwise takes the whole
+    list. On the 5,000-paper index, one inpainting paper supplied four of five
+    results. Capping costs a little raw similarity and buys the thing an answer
+    actually needs: more than one source.
+
+    Because capping discards results, the index is asked for ``oversample``
+    times as many as are wanted, and the first ``top_k`` that survive the cap
+    are returned. Scores stay in descending order throughout.
     """
+    if max_per_paper <= 0:
+        raise ValueError("max_per_paper must be positive")
+
+    query_vector = embed_texts([query], encoder=encoder, show_progress=False)
+    scores, positions = search_index(index, query_vector, top_k=top_k * max(oversample, 1))
+
+    results = []
+    taken: dict[str, int] = {}
+
+    for score, position in zip(scores[0], positions[0], strict=True):
+        if position < 0:  # FAISS pads with -1 when it holds fewer than asked for
+            continue
+
+        chunk = chunks[position]
+        if taken.get(chunk.paper_id, 0) >= max_per_paper:
+            continue
+
+        taken[chunk.paper_id] = taken.get(chunk.paper_id, 0) + 1
+        results.append(SearchResult(chunk=chunk, score=float(score)))
+
+        if len(results) >= top_k:
+            break
+
+    return results
+
+
+def _search_uncapped(query: str, chunks: list[Chunk], index, encoder, top_k: int):
+    """Retrieval without the per-paper cap. Kept for comparison in tests."""
     query_vector = embed_texts([query], encoder=encoder, show_progress=False)
     scores, positions = search_index(index, query_vector, top_k=top_k)
 
@@ -59,6 +105,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search the indexed arXiv papers.")
     parser.add_argument("query", help="What you want to find, in plain English.")
     parser.add_argument("--top-k", type=int, default=config.TOP_K, help="How many results.")
+    parser.add_argument("--max-per-paper", type=int, default=config.MAX_CHUNKS_PER_PAPER,
+                        help="At most this many passages from any one paper.")
     parser.add_argument("--chunks-file", default=str(config.CHUNKS_FILE))
     return parser.parse_args()
 
@@ -73,7 +121,8 @@ def main() -> None:
     index = load_index(config.INDEX_FILE)
     encoder = load_encoder()
 
-    results = search(args.query, chunks, index, encoder, top_k=args.top_k)
+    results = search(args.query, chunks, index, encoder, top_k=args.top_k,
+                     max_per_paper=args.max_per_paper)
 
     print(f'\nQuery: "{args.query}"')
     print(f"Searched {index.ntotal} passages from "
@@ -89,4 +138,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        sys.exit(130)

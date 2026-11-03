@@ -208,6 +208,89 @@ def test_search_asks_for_no_more_results_than_the_corpus_holds():
     assert len(results) == len(CORPUS)
 
 
+# --- the per-paper cap -----------------------------------------------------
+#
+# Measured on the real index: "how do diffusion models handle image inpainting"
+# returned four of its five results from one paper. For search that is untidy;
+# for a generated answer it means every citation points at a single source.
+
+
+def big_corpus() -> list[Chunk]:
+    """One paper that matches "inpainting" strongly across five chunks, and two
+    weaker papers. Each hog chunk mixes in a little more of another vocabulary
+    word, so their scores descend but all stay above the other two papers."""
+    chunks = [
+        Chunk(chunk_id=f"hog::{i}", paper_id="hog", title="The Hogging Paper",
+              text="inpainting " * 5 + "transformer " * i, chunk_index=i,
+              word_count=5 + i)
+        for i in range(5)
+    ]
+    chunks += [
+        Chunk(chunk_id="other1::0", paper_id="other1", title="Second Paper",
+              text="inpainting inpainting transformer transformer",
+              chunk_index=0, word_count=4),
+        Chunk(chunk_id="other2::0", paper_id="other2", title="Third Paper",
+              text="transformer transformer", chunk_index=0, word_count=2),
+    ]
+    return chunks
+
+
+def built(corpus, encoder):
+    return build_index(normalize(encoder.encode([c.text for c in corpus])))
+
+
+def test_without_a_cap_one_paper_can_take_the_whole_result_set():
+    """The behaviour the cap exists to stop."""
+    encoder, corpus = KeywordEncoder(), big_corpus()
+    results = search("inpainting", corpus, built(corpus, encoder), encoder,
+                     top_k=4, max_per_paper=99)
+
+    assert [r.chunk.paper_id for r in results].count("hog") == 4
+
+
+def test_the_cap_limits_how_many_passages_one_paper_contributes():
+    encoder, corpus = KeywordEncoder(), big_corpus()
+    results = search("inpainting", corpus, built(corpus, encoder), encoder,
+                     top_k=4, max_per_paper=2)
+
+    assert [r.chunk.paper_id for r in results].count("hog") <= 2
+
+
+def test_capping_pulls_in_other_papers_rather_than_returning_fewer_results():
+    """Oversampling is what makes this work: the index is asked for more than
+    is wanted, so discarded results are replaced rather than missing."""
+    encoder, corpus = KeywordEncoder(), big_corpus()
+    results = search("inpainting", corpus, built(corpus, encoder), encoder,
+                     top_k=3, max_per_paper=2)
+
+    assert len(results) == 3
+    assert len({r.chunk.paper_id for r in results}) >= 2
+
+
+def test_capped_results_stay_in_descending_score_order():
+    encoder, corpus = KeywordEncoder(), big_corpus()
+    results = search("inpainting", corpus, built(corpus, encoder), encoder,
+                     top_k=4, max_per_paper=2)
+
+    scores = [r.score for r in results]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_a_cap_of_one_gives_one_passage_per_paper():
+    encoder, corpus = KeywordEncoder(), big_corpus()
+    results = search("inpainting", corpus, built(corpus, encoder), encoder,
+                     top_k=3, max_per_paper=1)
+
+    paper_ids = [r.chunk.paper_id for r in results]
+    assert len(paper_ids) == len(set(paper_ids))
+
+
+def test_a_cap_of_zero_is_rejected():
+    encoder, corpus = KeywordEncoder(), big_corpus()
+    with pytest.raises(ValueError, match="max_per_paper must be positive"):
+        search("inpainting", corpus, built(corpus, encoder), encoder, max_per_paper=0)
+
+
 def test_scores_are_between_minus_one_and_one():
     """Cosine similarity cannot leave that range. Anything else means the
     vectors were never normalised."""

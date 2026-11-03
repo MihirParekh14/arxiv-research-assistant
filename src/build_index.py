@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 
 from src import config
@@ -118,4 +119,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Finished blocks are already on disk, so stopping here loses at most
+        # the block in progress. Say so instead of printing a traceback.
+        print("\n\nStopped. Finished blocks are saved.")
+        print("Run `python -m src.build_index` again to carry on from the last one.")
+        sys.exit(130)

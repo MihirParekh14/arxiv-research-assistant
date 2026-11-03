@@ -79,6 +79,42 @@ CLASSIFIER_BASE_MODEL = "roberta-base"
 
 TOP_K = 5
 
+# At most this many passages from any one paper may appear in a result set.
+#
+# Measured, not guessed. On a 5,000-paper index, "how do diffusion models
+# handle image inpainting" returned four of its five results from a single
+# paper. For search that is only untidy; for a generated answer it is a real
+# defect, because all five passages become the material the answer is written
+# from, and an answer drawn from one source cites one source and sounds just as
+# confident either way.
+MAX_CHUNKS_PER_PAPER = 2
+
+# The index is asked for this multiple of TOP_K before the per-paper cap is
+# applied, so capping still leaves enough results to fill the list.
+RETRIEVAL_OVERSAMPLE = 5
+
+# --- Answer confidence -----------------------------------------------------
+#
+# The top result's score decides whether an answer is attempted. An earlier
+# idea -- treating a narrow spread between the top and bottom scores as low
+# confidence -- was tested on a corpus five times larger and did not survive:
+# a narrow spread turns out to mean either "nothing matches" or "everything
+# matches well", and nothing distinguishes the two. The top score tracked
+# answer quality in every run, so it is what is used.
+#
+# Both thresholds are provisional starting points. Stage 6 measures them
+# against a held-out question set rather than leaving them to judgement.
+MIN_ANSWER_SCORE = 0.35
+WEAK_ANSWER_SCORE = 0.50
+
+# --- Generation ------------------------------------------------------------
+
+ANSWER_BACKEND = "extractive"
+ANTHROPIC_MODEL = "claude-sonnet-4-5"
+OLLAMA_MODEL = "llama3.2"
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MAX_ANSWER_TOKENS = 700
+
 # --- Reproducibility -------------------------------------------------------
 
 RANDOM_SEED = 42
