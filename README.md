@@ -1,5 +1,7 @@
 # arXiv Research Assistant
 
+[![CI](https://github.com/MihirParekh14/arxiv-research-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/MihirParekh14/arxiv-research-assistant/actions/workflows/ci.yml)
+
 A retrieval-augmented question answering system over arXiv papers.
 
 Ask a question in plain English, and the system searches a corpus of papers,
