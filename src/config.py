@@ -93,6 +93,30 @@ MAX_CHUNKS_PER_PAPER = 2
 # applied, so capping still leaves enough results to fill the list.
 RETRIEVAL_OVERSAMPLE = 5
 
+# --- Reranking -------------------------------------------------------------
+#
+# The embedding search never sees the question and a passage at the same time.
+# It compares two vectors that were built independently, which is what makes it
+# fast enough to scan 253,000 passages -- and also what makes it miss things no
+# reader would miss. Two measured failures on this corpus:
+#
+#   "how does LoRA work"
+#       -> 3 of 5 passages about Low-Rank Adaptation, 2 about LoRa, the radio
+#          protocol. Different technology, nearly the same spelling.
+#
+#   "how does low-rank adaptation work for fine-tuning language models"
+#       -> 1 of 5. The added common words diluted the one distinctive term
+#          until the query pointed at generic NLP fine-tuning. It also scored
+#          HIGHER (0.680 vs 0.645) while being worse.
+#
+# A cross-encoder reads the question and the passage together and scores the
+# pair. That is slower -- one forward pass per candidate instead of one lookup
+# -- so it runs over a shortlist, not the corpus.
+RERANK_ENABLED = True
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_CANDIDATES = 30
+RERANK_BATCH_SIZE = 32
+
 # --- Answer confidence -----------------------------------------------------
 #
 # The top result's score decides whether an answer is attempted. An earlier
@@ -106,6 +130,18 @@ RETRIEVAL_OVERSAMPLE = 5
 # against a held-out question set rather than leaving them to judgement.
 MIN_ANSWER_SCORE = 0.35
 WEAK_ANSWER_SCORE = 0.50
+
+# Reranked results are graded on a different scale and need their own numbers.
+# A cross-encoder emits an unbounded logit, not a cosine similarity: roughly
+# -11 to +11 for this model, where above zero means the pair looks relevant.
+# Reusing the cosine thresholds here would be a unit error -- every reranked
+# answer would pass the gate, including the ones that should be refused.
+#
+# These two are the least evidence-backed numbers in the project. They are
+# starting points taken from the model's usual output range, not measurements,
+# and stage 6 replaces them with values fitted to a held-out question set.
+MIN_RERANK_SCORE = -3.0
+WEAK_RERANK_SCORE = 1.0
 
 # --- Generation ------------------------------------------------------------
 

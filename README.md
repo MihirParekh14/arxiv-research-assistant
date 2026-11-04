@@ -22,8 +22,9 @@ This is being built in stages. Each stage is tested before the next begins.
 | 1. Ingestion | Download papers, clean, chunk with overlap | **Done** |
 | 2. Search | Encode chunks, build a FAISS index, retrieve by meaning | **Done** |
 | 3. Answers | Assemble a prompt from retrieved passages, generate with citations | **Done** |
-| 3.5 Reranking | Cross-encoder rerank over the top 20 (see known limitation) | Next |
-| 4. Classifier | Multi-label subject tagging (fine-tuned RoBERTa) | Planned |
+| 3.5 Reranking | Cross-encoder rerank over the shortlist | **Done** |
+| | *Known open issue: homonym collisions survive reranking* | |
+| 4. Classifier | Multi-label subject tagging (fine-tuned RoBERTa) | Next |
 | 5. Summarizer | Abstractive summaries (google/pegasus-arxiv) | Planned |
 | 6. Evaluation | Held-out splits, retrieval and answer metrics | Planned |
 
@@ -84,7 +85,12 @@ python -m src.ask "how do diffusion models handle image inpainting"
 python -m src.ask "what is speculative decoding" --backend ollama
 python -m src.ask "how does LoRA work" --backend anthropic
 python -m src.ask "anything" --show-prompt     # see exactly what the model is sent
+python -m src.ask "how does LoRA work" --no-rerank   # compare against retrieval alone
 ```
+
+Reranking is on by default and downloads an 80 MB cross-encoder on first use.
+`--no-rerank` turns it off, which is the comparison that shows whether it is
+earning its cost.
 
 The default backend is `extractive`: it returns the retrieved passages
 themselves and calls no model, so the project runs with no API key and the
@@ -317,16 +323,99 @@ Neither failure is fixed by a larger corpus; more papers means more radio
 papers. Both have the same cause: a bi-encoder embeds the query and the passage
 separately and never compares them directly.
 
-The standard fix is a **cross-encoder reranker** — retrieve twenty passages
-with the fast vector search, then score each one with a model that reads the
-question and the passage together. Reading both at once is what allows
-"spreading factor" to be recognised as irrelevant to a fine-tuning question.
-That is the next thing this project needs, ahead of anything in stages 4 or 5.
+Both have the same cause and the next section measures what fixing it bought.
 
 Also worth recording: the best explanation of LoRA in the whole corpus came
 from a passage inside *"Hate speech detection in algerian dialect using deep
 learning"*, a paper whose title gives no sign of it. Indexing whole papers
 would have missed it; indexing passages found it.
+
+### Reranking: reading the question and the passage together
+
+The limitation above has one cause. A bi-encoder embeds the question and the
+passage separately and never compares them directly — that independence is what
+lets 253,000 passages be precomputed and scanned in milliseconds, and it is
+also why "LoRA" and "LoRa" land in the same place.
+
+A cross-encoder takes the pair as a single input and returns one relevance
+score. It cannot be precomputed and it cannot be indexed, so it costs a forward
+pass per candidate. Over the whole corpus that is hopeless. Over the thirty
+passages the bi-encoder already shortlisted it costs a second or two.
+
+So the two are not alternatives. Retrieval finds candidates cheaply; reranking
+orders them properly.
+
+**The order of the pipeline is load-bearing.** Retrieve a wide shortlist →
+rerank → cap per paper → take the top *k*. Capping has to come last. Cap first
+and a passage gets discarded on the strength of a score the reranker was about
+to overrule — and once discarded it is never re-examined. There is a test named
+after exactly that.
+
+### What reranking actually fixed, and what it did not
+
+Both failing queries were re-run with reranking on, against the same index.
+
+| Query | passages about LoRA, no rerank | with rerank |
+|---|---|---|
+| "how does LoRA work" | 3 of 5 | 4 of 5 |
+| "how does low-rank adaptation work for fine-tuning language models" | **1 of 5** | **4 of 5** |
+
+**Dilution is fixed.** The long query recovered completely. That follows from
+how a cross-encoder works: it reads the whole question against each passage
+instead of averaging the question into a single vector, so adding ordinary
+words no longer washes out the one that matters.
+
+**The biggest gain was not reordering — it was surfacing.** The new top result
+for the short query is a passage giving the actual mathematics, `ΔW = BA` with
+`r << min(d,k)`. Its retrieval score was **0.436**; it was nowhere near the top
+five before. Reranking promoted it to first at **+7.72**. The two methods do
+not return the same passages in a different order. They return different
+passages.
+
+**The homonym is not fixed.** The LoRa radio passage survived at **+5.63**.
+That is not a bug in the reranker — the passage genuinely explains how LoRa
+works, and `ms-marco-MiniLM` lowercases its input, so "LoRA" and "LoRa" are the
+same string to it. The disambiguating signal is gone before the model sees it.
+
+And no threshold rescues this:
+
+| passage | rerank score | about LoRA? |
+|---|---|---|
+| DRG-LLaMA | +7.72 | yes |
+| Hate speech detection | +7.08 | yes |
+| **LoRa radio** | **+5.63** | **no** |
+| LoRA ensembles | +5.43 | yes |
+| LoRA safety training | +5.25 | yes |
+
+The wrong passage outscores two correct ones. Any cutoff that removes it
+removes them too. Fixing this needs a signal the pipeline currently discards —
+case-sensitive matching, or a reranker trained on this domain — not a tuned
+number.
+
+So: one failure mode closed, one documented and still open.
+
+**Two scores, two scales, and they are not interchangeable.** Cosine similarity
+runs 0 to 1; a cross-encoder logit runs roughly −11 to +11, where above zero
+means the pair looks relevant. Both are kept on every result and both are
+printed, because comparing them is the only way to see whether reranking is
+earning its cost — a passage showing `retrieval 1.000  rerank -6.00` is one the
+embedding search was certain about and the reranker rejected on reading.
+
+The confidence gate picks its thresholds from which scale it is looking at.
+Grading a logit against the cosine thresholds would be a unit error that passes
+every reranked answer, including the ones that exist to be refused.
+
+**Below the floor, a passage is dropped rather than ranked last.** Everything
+that reaches the prompt is material the model is invited to answer from, and a
+passage scoring −6 is not weak evidence — it is the wrong subject. Leaving it
+in the context and hoping the model ignores it is a worse design than removing
+it. The sources printed under an answer are therefore exactly the passages the
+model was shown.
+
+`MIN_RERANK_SCORE` and `WEAK_RERANK_SCORE` are the least evidence-backed
+numbers in this project: starting points taken from the model's usual output
+range, not measurements. Stage 6 replaces them with values fitted to a held-out
+question set.
 
 ### Refusing is a feature
 
@@ -348,7 +437,7 @@ pytest --cov=src --cov-report=term-missing
 ruff check src tests
 ```
 
-117 tests. CI runs both on Python 3.10, 3.11 and 3.12 on every push.
+140 tests. CI runs both on Python 3.10, 3.11 and 3.12 on every push.
 
 The tests never touch the network, never download a model and never need an API
 key. A stand-in encoder returns fixed vectors, so the whole suite runs anywhere
@@ -372,12 +461,20 @@ about proteins, not merely with *a* passage. The guards against a stale index �
 wrong corpus size, wrong model — are tested too, because both of those produce
 confident nonsense rather than an error.
 
-**What the model is allowed to see.** No test calls a model; the generator is
-injected. What is covered instead is everything around it: that the prompt
-contains every passage numbered from one, that those numbers match the source
-list so a citation can be checked, that the prompt forbids outside knowledge
-and permits refusal, that a weak result set returns a refusal *and reaches no
-generator at all*, and that one paper cannot take the whole result set.
+**What the model is allowed to see.** No test calls a model; both the generator
+and the reranker are injected. What is covered instead is everything around
+them: that the prompt contains every passage numbered from one, that those
+numbers match the source list so a citation can be checked, that the prompt
+forbids outside knowledge and permits refusal, that a weak result set returns a
+refusal *and reaches no generator at all*, that one paper cannot take the whole
+result set, and that a passage below the floor never reaches the prompt.
+
+**That each rerank score lands on the passage it was computed for.** Scores
+come back from the model as a bare list and are zipped onto the results; an
+off-by-one there would reorder every answer plausibly and silently. Also
+tested: that capping runs *after* reranking, that a rerank score of exactly
+`0.0` is not mistaken for "no score", and that the two threshold scales stay
+apart.
 
 ---
 
@@ -393,6 +490,7 @@ src/
   ingest.py        command line: download and chunk
   build_index.py   command line: encode and index
   search.py        command line: search
+  rerank.py        re-score a shortlist with a cross-encoder
   answer.py        confidence, prompt assembly, generator backends
   ask.py           command line: ask a question
 tests/             pytest suite, no network or model required

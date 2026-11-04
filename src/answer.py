@@ -46,7 +46,15 @@ class Answer:
 
     @property
     def top_score(self) -> float:
-        return self.results[0].score if self.results else 0.0
+        """The score the confidence gate actually read."""
+        return self.results[0].relevance if self.results else 0.0
+
+    @property
+    def scale(self) -> str:
+        """Which scale ``top_score`` is on, since the two are not comparable."""
+        if self.results and self.results[0].was_reranked:
+            return "cross-encoder"
+        return "cosine"
 
 
 def confidence_for(results: list[SearchResult]) -> str:
@@ -59,15 +67,44 @@ def confidence_for(results: list[SearchResult]) -> str:
     nothing matched and when everything matched well, and the two are
     indistinguishable from the spread alone. The top score separated good
     answers from bad ones in every run.
+
+    Which thresholds apply depends on where the top score came from. Cosine
+    similarity runs 0 to 1; a cross-encoder logit runs roughly -11 to +11.
+    Grading a logit against the cosine thresholds would pass every reranked
+    answer, including the ones that exist to be refused.
     """
     if not results:
         return "none"
-    top = results[0].score
-    if top < config.MIN_ANSWER_SCORE:
+
+    top = results[0]
+    floor, weak = thresholds_for(results)
+
+    if top.relevance < floor:
         return "none"
-    if top < config.WEAK_ANSWER_SCORE:
+    if top.relevance < weak:
         return "weak"
     return "ok"
+
+
+def thresholds_for(results: list[SearchResult]) -> tuple[float, float]:
+    """The (floor, weak) pair that applies to how these results were scored."""
+    if results and results[0].was_reranked:
+        return config.MIN_RERANK_SCORE, config.WEAK_RERANK_SCORE
+    return config.MIN_ANSWER_SCORE, config.WEAK_ANSWER_SCORE
+
+
+def usable(results: list[SearchResult]) -> list[SearchResult]:
+    """Drop passages that score below the floor.
+
+    Ranking a bad passage last is not enough. Everything that reaches the
+    prompt is material the model is invited to answer from, and a passage the
+    reranker scored at -6 is not weak evidence, it is the wrong subject --
+    LoRa the radio protocol sitting underneath a question about fine-tuning.
+    Leaving it in the context and hoping the model ignores it is a worse
+    design than removing it.
+    """
+    floor, _ = thresholds_for(results)
+    return [result for result in results if result.relevance >= floor]
 
 
 def build_prompt(question: str, results: list[SearchResult]) -> str:
@@ -97,10 +134,11 @@ def format_sources(results: list[SearchResult]) -> str:
     lines = []
     for number, result in enumerate(results, start=1):
         chunk = result.chunk
+        scores = (f"rerank {result.rerank_score:+.2f}  retrieval {result.score:.3f}"
+                  if result.was_reranked else f"score {result.score:.3f}")
         lines.append(
             f"[{number}] {chunk.title}\n"
-            f"    arXiv:{chunk.paper_id}  chunk {chunk.chunk_index}  "
-            f"score {result.score:.3f}\n"
+            f"    arXiv:{chunk.paper_id}  chunk {chunk.chunk_index}  {scores}\n"
             f"    https://arxiv.org/abs/{chunk.paper_id}"
         )
     return "\n".join(lines)
@@ -229,6 +267,9 @@ def answer_question(
     model, an API key or a network.
     """
     confidence = confidence_for(results)
+    # Only passages above the floor reach the prompt, and only those are shown
+    # as sources, so the citations list matches what the answer was built from.
+    kept = usable(results) if confidence != "none" else results
 
     if confidence == "none":
         return Answer(
@@ -242,8 +283,8 @@ def answer_question(
             backend=backend,
         )
 
-    prompt = build_prompt(question, results)
-    text = generator(prompt, results, backend)
+    prompt = build_prompt(question, kept)
+    text = generator(prompt, kept, backend)
 
     if confidence == "weak":
         text = (
@@ -251,4 +292,4 @@ def answer_question(
             "and check the sources.\n\n" + text
         )
 
-    return Answer(text=text, results=results, confidence=confidence, backend=backend)
+    return Answer(text=text, results=kept, confidence=confidence, backend=backend)

@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
                         help="How many passages to answer from.")
     parser.add_argument("--max-per-paper", type=int, default=config.MAX_CHUNKS_PER_PAPER,
                         help="At most this many passages from any one paper.")
+    parser.add_argument("--rerank", dest="rerank", action="store_true", default=None,
+                        help="Re-score the shortlist with a cross-encoder (default on).")
+    parser.add_argument("--no-rerank", dest="rerank", action="store_false",
+                        help="Skip reranking, to compare against the embedding search alone.")
+    parser.add_argument("--candidates", type=int, default=config.RERANK_CANDIDATES,
+                        help="How many passages to shortlist before reranking.")
     parser.add_argument("--chunks-file", default=str(config.CHUNKS_FILE))
     parser.add_argument("--show-prompt", action="store_true",
                         help="Print the prompt sent to the model, then the answer.")
@@ -51,8 +57,17 @@ def main() -> None:
     index = load_index(config.INDEX_FILE)
     encoder = load_encoder()
 
+    use_rerank = config.RERANK_ENABLED if args.rerank is None else args.rerank
+    reranker = None
+    if use_rerank:
+        from src.rerank import load_reranker  # noqa: PLC0415
+
+        print(f"Reranking with {config.RERANK_MODEL} ...")
+        reranker = load_reranker()
+
     results = search(args.question, chunks, index, encoder,
-                     top_k=args.top_k, max_per_paper=args.max_per_paper)
+                     top_k=args.top_k, max_per_paper=args.max_per_paper,
+                     reranker=reranker, candidates=args.candidates)
 
     if args.show_prompt:
         from src.answer import build_prompt  # noqa: PLC0415
@@ -67,7 +82,8 @@ def main() -> None:
     print(f"Searched {index.ntotal} passages from "
           f"{len({chunk.paper_id for chunk in chunks})} papers.")
     print(f"Confidence: {answer.confidence} "
-          f"(top score {answer.top_score:.3f}) -- {CONFIDENCE_NOTE[answer.confidence]}")
+          f"(top {answer.scale} score {answer.top_score:+.3f}) "
+          f"-- {CONFIDENCE_NOTE[answer.confidence]}")
     print(f"Answer by: {answer.backend}\n")
 
     print(textwrap.fill(answer.text, width=88) if answer.confidence == "none"
